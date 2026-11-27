@@ -23,7 +23,7 @@ namespace ob {
 constexpr uint32_t kDefaultGraphCacheCapacity     = 512u;
 constexpr size_t   kDefaultBufferPoolMaxBytes     = 64u * 1024u * 1024u;
 constexpr size_t   kDefaultBufferPoolMaxCount     = 256u;
-constexpr size_t   kDefaultWeightCacheMaxEntries  = 4096u;
+constexpr size_t   kDefaultWeightCacheMaxEntries  = 16384u;
 constexpr uint32_t kDefaultTimeoutMs              = 5000u;
 constexpr uint32_t kDefaultTileMaxM           = 64u;
 constexpr uint32_t kDefaultTileMaxK           = 2048u;
@@ -195,6 +195,15 @@ struct PooledSlab {
   bool iova_mapped = false;
 };
 
+struct ExternalDmabufMap {
+  int dmabuf_fd = -1;
+  uint64_t offset = 0;
+  uint64_t size = 0;
+  uint64_t iova = 0;
+  uint32_t map_flags = 0;
+  uint32_t die_index = 0xffffffffu;
+};
+
 struct CachedGraph {
   CacheKey key{};
   ob_context* ctx = nullptr;
@@ -306,11 +315,12 @@ bool        device_attach_inflight_buffers(ob_context* ctx,
                                            ob_exec_handle_t handle,
                                            std::initializer_list<ob_buffer*> bufs);
 
-// Buffer pool helpers (implemented in ob_buffer_pool.cpp)
+// Buffer pool & external DMA-BUF helpers (implemented in ob_buffer_pool.cpp)
 size_t buffer_slab_size(size_t requested);
 void buffer_retain(ob_buffer* buf);
 void buffer_destroy_slab(ob_context* ctx, PooledSlab* slab);
 void buffer_pool_clear(ob_context* ctx);
+void ext_dmabuf_clear(ob_context* ctx);
 ob_status_t buffer_sync_begin_read(ob_buffer* buf);
 ob_status_t buffer_sync_end_read(ob_buffer* buf);
 ob_status_t buffer_sync_begin_write(ob_buffer* buf);
@@ -752,6 +762,8 @@ struct ob_context {
   // Ordered LRU of free slabs + bucket index by alloc_size
   std::list<ob::PooledSlab> pool_lru;
   std::unordered_map<size_t, std::vector<std::list<ob::PooledSlab>::iterator>> pool_buckets;
+  // External DMA-BUFs mapped into ctx->tpu_fd's grouped IOMMU domain via ob_dmabuf_map
+  std::unordered_map<uint64_t, ob::ExternalDmabufMap> ext_dmabuf_maps;
 
   // Persistent graph LRU cache
   std::mutex cache_mu;
@@ -796,9 +808,10 @@ struct ob_context {
   std::list<ob::CachedWeightTile*> weight_cache_lru;
   size_t weight_cache_bytes = 0;
   size_t weight_cache_peak_bytes = 0;
-  size_t weight_cache_max_bytes = 0;   // lazily initialized (min(2048 MiB, MemAvailable/3) on Android)
+  size_t weight_cache_peak_entries = 0;
+  size_t weight_cache_max_bytes = 0;   // lazily initialized (auto up to 1536 MiB with 512 MiB reserve)
   size_t weight_cache_default_max_entries = ob::kDefaultWeightCacheMaxEntries;
-  size_t weight_cache_max_entries = 0; // FD-safe cap (default 4096, env OPENBUENOS_WEIGHT_CACHE_ENTRIES)
+  size_t weight_cache_max_entries = 0; // FD-safe cap (default 16384, env OPENBUENOS_WEIGHT_CACHE_ENTRIES)
   size_t outlier_cache_bytes = 0;      // Separate tracked total of cached FP32 outlier columns
   std::vector<ob::ImmutableWeightRegion> immutable_weight_regions;
   uint64_t next_immutable_region_gen = 1u;

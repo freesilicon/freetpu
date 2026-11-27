@@ -446,12 +446,14 @@ bool read_system_mem_available_bytes(size_t* out_bytes) {
 size_t compute_weight_cache_budget_bytes_impl(ob_context* ctx) {
   if (!ctx) return 0u;
   size_t base_cap = 0u;
+  bool explicit_cap = false;
   const char* env = std::getenv("OPENBUENOS_WEIGHT_CACHE_MB");
   if (env && env[0]) {
     unsigned long mb = std::strtoul(env, nullptr, 10);
     if (mb < 16ul) mb = 16ul;
     if (mb > 8192ul) mb = 8192ul;
     base_cap = static_cast<size_t>(mb) * 1024u * 1024u;
+    explicit_cap = true;
   } else {
     // 256 MiB on host mock; up to 2048 MiB on live Android device (bounded below MemAvailable/3).
     base_cap = ctx->mock_mode
@@ -472,10 +474,19 @@ size_t compute_weight_cache_budget_bytes_impl(ob_context* ctx) {
     }
   }
   if (have_mem_avail) {
-    // Android LMKD-safe ceiling: never let cached ext[2] DMA-BUFs exceed MemAvailable / 3.
+    // Auto mode uses LMKD-safe MemAvailable / 3 ceiling; explicit OPENBUENOS_WEIGHT_CACHE_MB
+    // honors higher budgets on Linux hosts while reserving >= 512 MiB OS/KV headroom (>= 450 MiB).
     const size_t lmkd_cap = mem_avail / 3u;
-    if (lmkd_cap < base_cap) {
-      base_cap = lmkd_cap;
+    size_t safe_cap = lmkd_cap;
+    if (explicit_cap) {
+      constexpr size_t kReserveBytes = 512u * 1024u * 1024u;
+      const size_t headroom_cap = (mem_avail > 640u * 1024u * 1024u)
+          ? (mem_avail - kReserveBytes)
+          : (mem_avail / 2u);
+      safe_cap = std::max<size_t>(lmkd_cap, headroom_cap);
+    }
+    if (safe_cap < base_cap) {
+      base_cap = safe_cap;
     }
   }
   return std::max<size_t>(base_cap, 1u * 1024u * 1024u);
@@ -491,7 +502,7 @@ void ensure_weight_cache_budget(ob_context* ctx, bool refresh_meminfo = false) {
     if (env_e && env_e[0]) {
       unsigned long lim = std::strtoul(env_e, nullptr, 10);
       if (lim < 64ul) lim = 64ul;
-      if (lim > 16384ul) lim = 16384ul;
+      if (lim > 32768ul) lim = 32768ul;
       ctx->weight_cache_max_entries = static_cast<size_t>(lim);
     } else {
       ctx->weight_cache_max_entries = ctx->weight_cache_default_max_entries;
@@ -572,6 +583,9 @@ bool weight_cache_insert_locked(ob_context* ctx, CachedWeightTile* tile) {
   ctx->weight_cache_bytes += tile->ext2_bytes;
   if (ctx->weight_cache_bytes > ctx->weight_cache_peak_bytes) {
     ctx->weight_cache_peak_bytes = ctx->weight_cache_bytes;
+  }
+  if (ctx->weight_cache_map.size() > ctx->weight_cache_peak_entries) {
+    ctx->weight_cache_peak_entries = ctx->weight_cache_map.size();
   }
   return true;
 }
@@ -2428,6 +2442,338 @@ void gemm_release_pipeline_buffers(ob_context* ctx) {
   ctx->immutable_weight_regions.clear();
 }
 
+bool compute_allow_lt_64x(uint32_t k_dim,
+                          const ob_gemm_f32_quant_job_t* jobs,
+                          uint32_t num_jobs,
+                          uint32_t max_k,
+                          uint32_t max_n,
+                          bool builtin_active,
+                          bool lt_enabled,
+                          bool blt_enabled,
+                          bool horiz_fusion,
+                          std::vector<ScheduledGroup>* scratch_groups) {
+  bool allow_lt_64x = (k_dim >= 256u && max_k >= 512u && max_n >= 128u);
+  if (!allow_lt_64x) return false;
+
+  bool all_ge_128 = true;
+  for (uint32_t j = 0u; j < num_jobs; ++j) {
+    if (jobs[j].n_dim < 128u) {
+      all_ge_128 = false;
+      break;
+    }
+  }
+  if (all_ge_128) return true;
+  if (!horiz_fusion || num_jobs < 2u || !builtin_active || !blt_enabled) {
+    return false;
+  }
+  build_scheduled_groups(64u, k_dim, jobs, num_jobs, max_k, max_n,
+                         builtin_active, lt_enabled, blt_enabled,
+                         horiz_fusion, scratch_groups);
+  if (scratch_groups->empty()) return false;
+  for (const ScheduledGroup& g : *scratch_groups) {
+    if (!is_lt_64x_shape(64u, g.hw_k, g.hw_n)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void split_scheduled_group_subs(const ScheduledGroup& grp,
+                                uint32_t hw_m,
+                                uint32_t max_k,
+                                uint32_t max_n,
+                                bool builtin_active,
+                                std::vector<ScheduledGroup>* out) {
+  out->clear();
+  const uint32_t k0 = grp.k0;
+  const uint32_t tk = grp.tk;
+  const uint32_t k_cap = (hw_m == 64u) ? std::min<uint32_t>(max_k, 1536u)
+                                       : std::min<uint32_t>(max_k, 2048u);
+  const uint32_t n_cap = (hw_m == 64u)
+      ? std::max<uint32_t>(128u, (std::min<uint32_t>(max_n, 1536u) / 32u) * 32u)
+      : std::min<uint32_t>(max_n, 2048u);
+
+  for (uint32_t si = 0u; si < grp.num_subs; ++si) {
+    const FusedSubSlice& sub = grp.subs[si];
+    std::vector<TileRect> rects;
+    uint32_t sh_k = 0u, sh_n = 0u;
+    if (hw_m == 64u) {
+      sh_k = ceil_lt_64x_k_dim(tk);
+      sh_n = std::max<uint32_t>(128u, align_up_u32(sub.tn, 32u));
+      if (sh_k > 0u && sh_k <= k_cap && sh_n <= n_cap && is_lt_64x_shape(64u, sh_k, sh_n)) {
+        rects.push_back({k0, tk, sub.n0, sub.tn, sh_k, sh_n});
+      }
+    } else if (hw_m == 1u && try_lt_1x_hw_dims(tk, sub.tn, k_cap, n_cap, &sh_k, &sh_n)) {
+      rects.push_back({k0, tk, sub.n0, sub.tn, sh_k, sh_n});
+    }
+    if (rects.empty()) {
+      append_small_tile_rects(hw_m, k0, tk, sub.n0, sub.tn, max_k, max_n,
+                              OB_QK8_0, builtin_active, &rects);
+    }
+    for (const TileRect& r : rects) {
+      ScheduledGroup sg {};
+      sg.k0 = r.k0;
+      sg.tk = r.tk;
+      sg.hw_k = r.hw_k;
+      sg.hw_n = r.hw_n;
+      sg.tn_total = r.tn;
+      sg.num_subs = 1u;
+      sg.subs[0] = {sub.job_idx, r.n0, r.tn, 0u};
+      out->push_back(sg);
+    }
+  }
+}
+
+WeightTileKey compute_quant_group_weight_key(const ob_context* ctx,
+                                             uint32_t k_dim,
+                                             const ob_gemm_f32_quant_job_t* jobs,
+                                             const ScheduledGroup& grp,
+                                             uint32_t pack_fmt,
+                                             bool strict_hash) {
+  WeightHash128 wh_st{};
+  const uint32_t num_subs = grp.num_subs;
+  const uint32_t k0 = grp.k0;
+  const uint32_t tk = grp.tk;
+  const uint32_t hw_k = grp.hw_k;
+  const uint32_t hw_n = grp.hw_n;
+
+  if (num_subs == 1u) {
+    const FusedSubSlice& sub = grp.subs[0];
+    const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
+    const ob_quant_type_t qtype = static_cast<ob_quant_type_t>(job.is_q4_0);
+    const uint64_t tag = quant_tile_hash_tag(qtype);
+    uint32_t whdr[5] = {sub.tn, tk, hw_k, hw_n, pack_fmt};
+    hash128_update(&wh_st, &tag, sizeof(tag));
+    hash128_update(&wh_st, whdr, sizeof(whdr));
+    const uint32_t qk = ob_quant_block_elements(qtype);
+    const size_t blk_sz = ob_quant_block_bytes(qtype);
+    const uint32_t nb_k_q = k_dim / qk;
+    const uint32_t blk_start = k0 / qk;
+    const uint32_t blk_end = (k0 + tk + qk - 1u) / qk;
+    const uint32_t blk_cnt_q = blk_end - blk_start;
+    if ((k0 % qk) != 0u || (tk % qk) != 0u) {
+      uint32_t sub_k[2] = {k0 % qk, tk};
+      hash128_update(&wh_st, sub_k, sizeof(sub_k));
+    }
+    const size_t row_blk_bytes = static_cast<size_t>(blk_cnt_q) * blk_sz;
+    const size_t row_stride_bytes = static_cast<size_t>(nb_k_q) * blk_sz;
+    const uint8_t* raw_base = static_cast<const uint8_t*>(job.b_nk) +
+                              (static_cast<size_t>(sub.n0) * nb_k_q + blk_start) * blk_sz;
+    hash_weight_tile_for_ctx(ctx, &wh_st, raw_base, row_stride_bytes, sub.tn,
+                             row_blk_bytes, strict_hash);
+  } else {
+    const uint64_t tag = 0x465553455F575431ULL;
+    uint32_t fhdr[5] = {num_subs, tk, hw_k, hw_n, pack_fmt};
+    hash128_update(&wh_st, &tag, sizeof(tag));
+    hash128_update(&wh_st, fhdr, sizeof(fhdr));
+    for (uint32_t si = 0u; si < num_subs; ++si) {
+      const FusedSubSlice& sub = grp.subs[si];
+      const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
+      const ob_quant_type_t qtype = static_cast<ob_quant_type_t>(job.is_q4_0);
+      uint32_t shdr[3] = {sub.tn, sub.out_off, static_cast<uint32_t>(qtype)};
+      hash128_update(&wh_st, shdr, sizeof(shdr));
+      const uint32_t qk = ob_quant_block_elements(qtype);
+      const size_t blk_sz = ob_quant_block_bytes(qtype);
+      const uint32_t nb_k_q = k_dim / qk;
+      const uint32_t blk_start = k0 / qk;
+      const uint32_t blk_end = (k0 + tk + qk - 1u) / qk;
+      const uint32_t blk_cnt_q = blk_end - blk_start;
+      if ((k0 % qk) != 0u || (tk % qk) != 0u) {
+        uint32_t sub_k[2] = {k0 % qk, tk};
+        hash128_update(&wh_st, sub_k, sizeof(sub_k));
+      }
+      const size_t row_blk_bytes = static_cast<size_t>(blk_cnt_q) * blk_sz;
+      const size_t row_stride_bytes = static_cast<size_t>(nb_k_q) * blk_sz;
+      const uint8_t* raw_base = static_cast<const uint8_t*>(job.b_nk) +
+                                (static_cast<size_t>(sub.n0) * nb_k_q + blk_start) * blk_sz;
+      hash_weight_tile_for_ctx(ctx, &wh_st, raw_base, row_stride_bytes, sub.tn,
+                               row_blk_bytes, strict_hash);
+    }
+  }
+  return finalize_weight_key(wh_st);
+}
+
+template <typename PrepareSpaceFn>
+ob_status_t pack_quant_group_tile_locked(ob_context* ctx,
+                                         uint32_t k_dim,
+                                         const ob_gemm_f32_quant_job_t* jobs,
+                                         const ScheduledGroup& grp,
+                                         bool tile_use_w8a16,
+                                         bool is_lt64_tile,
+                                         bool grp_has_q4_k,
+                                         const WeightTileKey& wh,
+                                         bool abort_if_uncacheable,
+                                         WorkerPool* pack_pool,
+                                         std::vector<int8_t>* b_q_tile,
+                                         PrepareSpaceFn& prepare_space,
+                                         bool* out_rejected_fusion,
+                                         bool* out_skipped_budget,
+                                         uint32_t* out_scale_d,
+                                         CachedWeightTile** out_tile) {
+  *out_rejected_fusion = false;
+  *out_skipped_budget = false;
+  *out_tile = nullptr;
+
+  const uint32_t k0 = grp.k0;
+  const uint32_t tk = grp.tk;
+  const uint32_t hw_k = grp.hw_k;
+  const uint32_t hw_n = grp.hw_n;
+  const uint32_t tn_total = grp.tn_total;
+  const uint32_t num_subs = grp.num_subs;
+
+  const size_t ext2_sz = tile_use_w8a16
+      ? pack_w8a16_ext2_size(hw_n, hw_k)
+      : (is_lt64_tile ? pack_ext2_size_for_lt_64x(hw_n, hw_k)
+                      : pack_ext2_size_for_tile(hw_n, hw_k, false));
+  const size_t ext2_slab_bytes = buffer_slab_size(ext2_sz);
+
+  // When prepacking at load time (abort_if_uncacheable && single-sub), bail BEFORE unpacking if budget is full.
+  if (abort_if_uncacheable && num_subs == 1u) {
+    bool fit_precheck = false;
+    ob_status_t chk_st = prepare_space(ext2_slab_bytes, &fit_precheck);
+    if (chk_st != OB_OK) return chk_st;
+    if (!fit_precheck) {
+      *out_skipped_budget = true;
+      return OB_OK;
+    }
+  }
+
+  b_q_tile->resize(static_cast<size_t>(hw_n) * hw_k);
+  if (tn_total < hw_n) {
+    std::memset(b_q_tile->data() + static_cast<size_t>(tn_total) * hw_k, 0,
+                static_cast<size_t>(hw_n - tn_total) * hw_k);
+  }
+  std::vector<float> sb_vec(tn_total, 0.0f);
+  std::vector<float> offset_vec(grp_has_q4_k ? tn_total : 0u, 0.0f);
+  bool any_nonzero_offset = false;
+  std::vector<RowNormStats> row_stats(tile_use_w8a16 ? 0u : tn_total);
+  uint32_t min_sub_d = 0xFFFFFFFFu;
+  double all_max_l2 = 0.0;
+  uint64_t all_max_l1 = 0ULL;
+  uint64_t all_max_asum = 0ULL;
+
+  for (uint32_t si = 0u; si < num_subs; ++si) {
+    const FusedSubSlice& sub = grp.subs[si];
+    const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
+    const ob_quant_type_t qtype = static_cast<ob_quant_type_t>(job.is_q4_0);
+    int8_t* bq_dst = b_q_tile->data() + static_cast<size_t>(sub.out_off) * hw_k;
+    float* sb_dst = sb_vec.data() + sub.out_off;
+    float* off_dst = grp_has_q4_k ? (offset_vec.data() + sub.out_off) : nullptr;
+    RowNormStats* st_dst = tile_use_w8a16 ? nullptr : (row_stats.data() + sub.out_off);
+    if (quant::requant_rows(qtype, job.b_nk, k_dim, sub.n0, sub.tn, k0, tk, hw_k,
+                            bq_dst, sb_dst, off_dst, pack_pool, st_dst)) {
+      any_nonzero_offset = true;
+    }
+    if (!tile_use_w8a16) {
+      double sub_max_l2 = 0.0;
+      uint64_t sub_max_l1 = 0ULL;
+      uint64_t sub_max_asum = 0ULL;
+      for (uint32_t ni = 0u; ni < sub.tn; ++ni) {
+        if (st_dst[ni].l2 > sub_max_l2) sub_max_l2 = st_dst[ni].l2;
+        if (st_dst[ni].l1 > sub_max_l1) sub_max_l1 = st_dst[ni].l1;
+        if (st_dst[ni].asum > sub_max_asum) sub_max_asum = st_dst[ni].asum;
+      }
+      if (sub_max_l2 > all_max_l2) all_max_l2 = sub_max_l2;
+      if (sub_max_l1 > all_max_l1) all_max_l1 = sub_max_l1;
+      if (sub_max_asum > all_max_asum) all_max_asum = sub_max_asum;
+      if (num_subs >= 2u) {
+        uint32_t sd = compute_scale_D_from_maxima(
+            sub_max_l2, sub_max_l1, sub_max_asum, tk, 0);
+        if (sd < min_sub_d) min_sub_d = sd;
+      }
+    }
+  }
+  if (any_nonzero_offset) {
+    sb_vec.insert(sb_vec.end(), offset_vec.begin(), offset_vec.end());
+  }
+
+  uint32_t scale_d = 1u;
+  if (!tile_use_w8a16) {
+    scale_d = compute_scale_D_from_maxima(
+        all_max_l2, all_max_l1, all_max_asum, tk, 0);
+
+    // Precision guard for horizontal fusion: if any sub-job's optimal D is
+    // > 1.5x smaller than the fused D (e.g. mixed sparse+dense synthetic test),
+    // cache a zero-byte split sentinel and run sub-jobs independently with exact D.
+    if (num_subs >= 2u && min_sub_d > 0u && (scale_d * 2u > min_sub_d * 3u)) {
+      bool sentinel_ok = false;
+      ob_status_t spst = prepare_space(0u, &sentinel_ok);
+      if (spst != OB_OK) return spst;
+      if (sentinel_ok) {
+        CachedWeightTile* sentinel = new (std::nothrow) CachedWeightTile();
+        if (sentinel) {
+          sentinel->key = wh;
+          sentinel->scale_d = scale_d;
+          sentinel->hw_k = hw_k;
+          sentinel->hw_n = hw_n;
+          sentinel->ext2_buf = nullptr;
+          sentinel->ext2_bytes = 0u;
+          sentinel->rejected_fusion = true;
+          if (!weight_cache_insert_locked(ctx, sentinel)) {
+            delete sentinel;
+          }
+        }
+      }
+      *out_scale_d = scale_d;
+      *out_rejected_fusion = true;
+      return OB_OK;
+    }
+  }
+
+  bool cacheable = false;
+  ob_status_t pst = prepare_space(ext2_slab_bytes, &cacheable);
+  if (pst != OB_OK) return pst;
+  if (abort_if_uncacheable && !cacheable) {
+    *out_skipped_budget = true;
+    return OB_OK;
+  }
+
+  ob_buffer* wbuf = nullptr;
+  ob_status_t wst = ob_buffer_alloc(
+      ctx, ext2_sz, OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL, &wbuf);
+  if (wst == OB_OK) {
+    wst = buffer_sync_begin_write(wbuf);
+    if (wst == OB_OK) {
+      uint8_t* dst_ext2 = static_cast<uint8_t*>(ob_buffer_data(wbuf));
+      if (tile_use_w8a16) {
+        pack_w8a16_ext2_into(dst_ext2, hw_n, hw_k, b_q_tile->data());
+      } else if (is_lt64_tile) {
+        pack_ext2_for_lt_64x_into(
+            dst_ext2, hw_n, hw_k, b_q_tile->data(), nullptr, pack_pool);
+      } else {
+        pack_ext2_for_tile_into(
+            dst_ext2, hw_n, hw_k, b_q_tile->data(), nullptr, false, pack_pool);
+      }
+      wst = buffer_sync_end_write(wbuf);
+    }
+  }
+  if (wst != OB_OK) {
+    if (wbuf) ob_buffer_free(wbuf);
+    return wst;
+  }
+
+  CachedWeightTile* tile = new (std::nothrow) CachedWeightTile();
+  if (!tile) {
+    ob_buffer_free(wbuf);
+    return OB_ERR_NO_MEMORY;
+  }
+  tile->key = wh;
+  tile->scale_d = scale_d;
+  tile->hw_k = hw_k;
+  tile->hw_n = hw_n;
+  tile->row_s_b = std::move(sb_vec);
+  tile->ext2_buf = wbuf;
+  tile->ext2_bytes = wbuf->slab.alloc_size;
+  if (cacheable) {
+    weight_cache_insert_locked(ctx, tile);
+  } else {
+    tile->in_cache = false;
+  }
+  *out_scale_d = scale_d;
+  *out_tile = tile;
+  return OB_OK;
+}
+
 }  // namespace ob
 
 extern "C" {
@@ -3752,35 +4098,9 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
   std::vector<uint8_t> packed_tile;
   std::vector<ob::ScheduledGroup> groups;
 
-  bool allow_lt_64x = (k_dim >= 256u && max_k >= 512u && max_n >= 128u);
-  if (allow_lt_64x) {
-    bool all_ge_128 = true;
-    for (uint32_t j = 0u; j < num_jobs; ++j) {
-      if (jobs[j].n_dim < 128u) {
-        all_ge_128 = false;
-        break;
-      }
-    }
-    if (!all_ge_128) {
-      if (!horiz_fusion || num_jobs < 2u || !builtin_active || !blt_enabled) {
-        allow_lt_64x = false;
-      } else {
-        ob::build_scheduled_groups(64u, k_dim, jobs, num_jobs, max_k, max_n,
-                                   builtin_active, lt_enabled, blt_enabled,
-                                   horiz_fusion, &groups);
-        if (groups.empty()) {
-          allow_lt_64x = false;
-        } else {
-          for (const ob::ScheduledGroup& g : groups) {
-            if (!ob::is_lt_64x_shape(64u, g.hw_k, g.hw_n)) {
-              allow_lt_64x = false;
-              break;
-            }
-          }
-        }
-      }
-    }
-  }
+  const bool allow_lt_64x = ob::compute_allow_lt_64x(
+      k_dim, jobs, num_jobs, max_k, max_n, builtin_active, lt_enabled, blt_enabled,
+      horiz_fusion, &groups);
 
   std::vector<ob::MSlice> m_slices = ob::build_m_slices(
       m_dim, max_m, builtin_active, true, allow_lt_64x, blt_enabled);
@@ -3817,40 +4137,11 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
 
       // Helper to split a rejected multi-sub horizontal fusion cleanly into 1-sub groups.
       auto fallback_split_subs = [&]() -> ob_status_t {
-        for (uint32_t si = 0u; si < num_subs; ++si) {
-          const ob::FusedSubSlice& sub = grp.subs[si];
-          std::vector<ob::TileRect> rects;
-          const uint32_t k_cap = (hw_m == 64u) ? std::min<uint32_t>(max_k, 1536u)
-                                               : std::min<uint32_t>(max_k, 2048u);
-          const uint32_t n_cap = (hw_m == 64u)
-              ? std::max<uint32_t>(128u, (std::min<uint32_t>(max_n, 1536u) / 32u) * 32u)
-              : std::min<uint32_t>(max_n, 2048u);
-          uint32_t sh_k = 0u, sh_n = 0u;
-          if (hw_m == 64u) {
-            sh_k = ob::ceil_lt_64x_k_dim(tk);
-            sh_n = std::max<uint32_t>(128u, ob::align_up_u32(sub.tn, 32u));
-            if (sh_k > 0u && sh_k <= k_cap && sh_n <= n_cap && ob::is_lt_64x_shape(64u, sh_k, sh_n)) {
-              rects.push_back({k0, tk, sub.n0, sub.tn, sh_k, sh_n});
-            }
-          } else if (hw_m == 1u && ob::try_lt_1x_hw_dims(tk, sub.tn, k_cap, n_cap, &sh_k, &sh_n)) {
-            rects.push_back({k0, tk, sub.n0, sub.tn, sh_k, sh_n});
-          }
-          if (rects.empty()) {
-            ob::append_small_tile_rects(hw_m, k0, tk, sub.n0, sub.tn, max_k, max_n,
-                                        OB_QK8_0, builtin_active, &rects);
-          }
-          for (const ob::TileRect& r : rects) {
-            ob::ScheduledGroup sg {};
-            sg.k0 = r.k0;
-            sg.tk = r.tk;
-            sg.hw_k = r.hw_k;
-            sg.hw_n = r.hw_n;
-            sg.tn_total = r.tn;
-            sg.num_subs = 1u;
-            sg.subs[0] = {sub.job_idx, r.n0, r.tn, 0u};
-            ob_status_t sst = self_ref(sg, self_ref);
-            if (sst != OB_OK) return sst;
-          }
+        std::vector<ob::ScheduledGroup> split_groups;
+        ob::split_scheduled_group_subs(grp, hw_m, max_k, max_n, builtin_active, &split_groups);
+        for (const ob::ScheduledGroup& sg : split_groups) {
+          ob_status_t sst = self_ref(sg, self_ref);
+          if (sst != OB_OK) return sst;
         }
         return OB_OK;
       };
@@ -4013,61 +4304,8 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
           const bool is_lt64_tile = (!tile_use_w8a16) && ob::is_lt_64x_shape(hw_m, hw_k, hw_n);
           const uint32_t pack_fmt = tile_use_w8a16 ? 2u : (is_lt64_tile ? 1u : 0u);
           const uint64_t th0 = prof_on ? ob::monotonic_now_ns() : 0u;
-          ob::WeightHash128 wh_st{};
-          if (num_subs == 1u) {
-            const ob::FusedSubSlice& sub = grp.subs[0];
-            const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
-            const ob_quant_type_t qtype = static_cast<ob_quant_type_t>(job.is_q4_0);
-            const uint64_t tag = ob::quant_tile_hash_tag(qtype);
-            uint32_t whdr[5] = {sub.tn, tk, hw_k, hw_n, pack_fmt};
-            ob::hash128_update(&wh_st, &tag, sizeof(tag));
-            ob::hash128_update(&wh_st, whdr, sizeof(whdr));
-            const uint32_t qk = ob_quant_block_elements(qtype);
-            const size_t blk_sz = ob_quant_block_bytes(qtype);
-            const uint32_t nb_k_q = k_dim / qk;
-            const uint32_t blk_start = k0 / qk;
-            const uint32_t blk_end = (k0 + tk + qk - 1u) / qk;
-            const uint32_t blk_cnt_q = blk_end - blk_start;
-            if ((k0 % qk) != 0u || (tk % qk) != 0u) {
-              uint32_t sub_k[2] = {k0 % qk, tk};
-              ob::hash128_update(&wh_st, sub_k, sizeof(sub_k));
-            }
-            const size_t row_blk_bytes = static_cast<size_t>(blk_cnt_q) * blk_sz;
-            const size_t row_stride_bytes = static_cast<size_t>(nb_k_q) * blk_sz;
-            const uint8_t* raw_base = static_cast<const uint8_t*>(job.b_nk) +
-                                      (static_cast<size_t>(sub.n0) * nb_k_q + blk_start) * blk_sz;
-            ob::hash_weight_tile_for_ctx(ctx, &wh_st, raw_base, row_stride_bytes, sub.tn,
-                                         row_blk_bytes, strict_hash);
-          } else {
-            const uint64_t tag = 0x465553455F575431ULL;
-            uint32_t fhdr[5] = {num_subs, tk, hw_k, hw_n, pack_fmt};
-            ob::hash128_update(&wh_st, &tag, sizeof(tag));
-            ob::hash128_update(&wh_st, fhdr, sizeof(fhdr));
-            for (uint32_t si = 0u; si < num_subs; ++si) {
-              const ob::FusedSubSlice& sub = grp.subs[si];
-              const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
-              const ob_quant_type_t qtype = static_cast<ob_quant_type_t>(job.is_q4_0);
-              uint32_t shdr[3] = {sub.tn, sub.out_off, static_cast<uint32_t>(qtype)};
-              ob::hash128_update(&wh_st, shdr, sizeof(shdr));
-              const uint32_t qk = ob_quant_block_elements(qtype);
-              const size_t blk_sz = ob_quant_block_bytes(qtype);
-              const uint32_t nb_k_q = k_dim / qk;
-              const uint32_t blk_start = k0 / qk;
-              const uint32_t blk_end = (k0 + tk + qk - 1u) / qk;
-              const uint32_t blk_cnt_q = blk_end - blk_start;
-              if ((k0 % qk) != 0u || (tk % qk) != 0u) {
-                uint32_t sub_k[2] = {k0 % qk, tk};
-                ob::hash128_update(&wh_st, sub_k, sizeof(sub_k));
-              }
-              const size_t row_blk_bytes = static_cast<size_t>(blk_cnt_q) * blk_sz;
-              const size_t row_stride_bytes = static_cast<size_t>(nb_k_q) * blk_sz;
-              const uint8_t* raw_base = static_cast<const uint8_t*>(job.b_nk) +
-                                        (static_cast<size_t>(sub.n0) * nb_k_q + blk_start) * blk_sz;
-              ob::hash_weight_tile_for_ctx(ctx, &wh_st, raw_base, row_stride_bytes, sub.tn,
-                                           row_blk_bytes, strict_hash);
-            }
-          }
-          const ob::WeightTileKey wh = ob::finalize_weight_key(wh_st);
+          const ob::WeightTileKey wh = ob::compute_quant_group_weight_key(
+              ctx, k_dim, jobs, grp, pack_fmt, strict_hash);
           w_tile = ob::weight_cache_find_locked(ctx, wh);
           if (prof_on) ctx->prof.hash_ns += (ob::monotonic_now_ns() - th0);
 
@@ -4077,144 +4315,19 @@ ob_status_t ob_gemm_matmul_f32_quant_batch(ob_context_t* ctx,
 
           if (!w_tile) {
             const uint64_t tp0 = prof_on ? ob::monotonic_now_ns() : 0u;
-            b_q_tile.resize(static_cast<size_t>(hw_n) * hw_k);
-            if (tn_total < hw_n) {
-              std::memset(b_q_tile.data() + static_cast<size_t>(tn_total) * hw_k, 0,
-                          static_cast<size_t>(hw_n - tn_total) * hw_k);
-            }
-            std::vector<float> sb_vec(tn_total, 0.0f);
-            std::vector<float> offset_vec(grp_has_q4_k ? tn_total : 0u, 0.0f);
-            bool any_nonzero_offset = false;
-            std::vector<ob::RowNormStats> row_stats(tile_use_w8a16 ? 0u : tn_total);
-            uint32_t min_sub_d = 0xFFFFFFFFu;
-            double all_max_l2 = 0.0;
-            uint64_t all_max_l1 = 0ULL;
-            uint64_t all_max_asum = 0ULL;
-
-            for (uint32_t si = 0u; si < num_subs; ++si) {
-              const ob::FusedSubSlice& sub = grp.subs[si];
-              const ob_gemm_f32_quant_job_t& job = jobs[sub.job_idx];
-              const ob_quant_type_t qtype = static_cast<ob_quant_type_t>(job.is_q4_0);
-              int8_t* bq_dst = b_q_tile.data() + static_cast<size_t>(sub.out_off) * hw_k;
-              float* sb_dst = sb_vec.data() + sub.out_off;
-              float* off_dst = grp_has_q4_k ? (offset_vec.data() + sub.out_off) : nullptr;
-              ob::RowNormStats* st_dst =
-                  tile_use_w8a16 ? nullptr : (row_stats.data() + sub.out_off);
-              if (ob::quant::requant_rows(qtype, job.b_nk, k_dim, sub.n0, sub.tn, k0, tk, hw_k,
-                                          bq_dst, sb_dst, off_dst, &ctx->worker_pool, st_dst)) {
-                any_nonzero_offset = true;
-              }
-              if (!tile_use_w8a16) {
-                double sub_max_l2 = 0.0;
-                uint64_t sub_max_l1 = 0ULL;
-                uint64_t sub_max_asum = 0ULL;
-                for (uint32_t ni = 0u; ni < sub.tn; ++ni) {
-                  if (st_dst[ni].l2 > sub_max_l2) sub_max_l2 = st_dst[ni].l2;
-                  if (st_dst[ni].l1 > sub_max_l1) sub_max_l1 = st_dst[ni].l1;
-                  if (st_dst[ni].asum > sub_max_asum) sub_max_asum = st_dst[ni].asum;
-                }
-                if (sub_max_l2 > all_max_l2) all_max_l2 = sub_max_l2;
-                if (sub_max_l1 > all_max_l1) all_max_l1 = sub_max_l1;
-                if (sub_max_asum > all_max_asum) all_max_asum = sub_max_asum;
-                if (num_subs >= 2u) {
-                  uint32_t sd = ob::compute_scale_D_from_maxima(
-                      sub_max_l2, sub_max_l1, sub_max_asum, tk, 0);
-                  if (sd < min_sub_d) min_sub_d = sd;
-                }
-              }
-            }
-            if (any_nonzero_offset) {
-              sb_vec.insert(sb_vec.end(), offset_vec.begin(), offset_vec.end());
-            }
-
-            if (!tile_use_w8a16) {
-              scale_d = ob::compute_scale_D_from_maxima(
-                  all_max_l2, all_max_l1, all_max_asum, tk, 0);
-
-              // Precision guard for horizontal fusion: if any sub-job's optimal D is
-              // > 1.5x smaller than the fused D (e.g. mixed sparse+dense synthetic test),
-              // cache a zero-byte split sentinel and run sub-jobs independently with exact D.
-              if (num_subs >= 2u && min_sub_d > 0u && (scale_d * 2u > min_sub_d * 3u)) {
-                bool sentinel_ok = false;
-                ob_status_t spst = prepare_cache_space(0u, &sentinel_ok);
-                if (spst != OB_OK) {
-                  drain_all_cleanup();
-                  return spst;
-                }
-                if (sentinel_ok) {
-                  ob::CachedWeightTile* sentinel = new (std::nothrow) ob::CachedWeightTile();
-                  if (sentinel) {
-                    sentinel->key = wh;
-                    sentinel->scale_d = scale_d;
-                    sentinel->hw_k = hw_k;
-                    sentinel->hw_n = hw_n;
-                    sentinel->ext2_buf = nullptr;
-                    sentinel->ext2_bytes = 0u;
-                    sentinel->rejected_fusion = true;
-                    if (!ob::weight_cache_insert_locked(ctx, sentinel)) {
-                      delete sentinel;
-                    }
-                  }
-                }
-                if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
-                return fallback_split_subs();
-              }
-            }
-
-            const size_t ext2_sz = tile_use_w8a16
-                ? ob::pack_w8a16_ext2_size(hw_n, hw_k)
-                : (is_lt64_tile ? ob::pack_ext2_size_for_lt_64x(hw_n, hw_k)
-                                : ob::pack_ext2_size_for_tile(hw_n, hw_k, false));
-            bool cacheable = false;
-            const size_t ext2_slab_bytes = ob::buffer_slab_size(ext2_sz);
-            ob_status_t pst = prepare_cache_space(ext2_slab_bytes, &cacheable);
+            bool rejected_fusion = false;
+            bool skipped_budget = false;
+            ob_status_t pst = ob::pack_quant_group_tile_locked(
+                ctx, k_dim, jobs, grp, tile_use_w8a16, is_lt64_tile, grp_has_q4_k, wh,
+                false, &ctx->worker_pool, &b_q_tile, prepare_cache_space,
+                &rejected_fusion, &skipped_budget, &scale_d, &w_tile);
+            if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
             if (pst != OB_OK) {
               drain_all_cleanup();
               return pst;
             }
-
-            ob_buffer* wbuf = nullptr;
-            ob_status_t wst = ob_buffer_alloc(
-                ctx, ext2_sz, OB_BUF_BIDIRECTIONAL | OB_BUF_NO_POOL, &wbuf);
-            if (wst == OB_OK) {
-              wst = ob::buffer_sync_begin_write(wbuf);
-              if (wst == OB_OK) {
-                uint8_t* dst_ext2 = static_cast<uint8_t*>(ob_buffer_data(wbuf));
-                if (tile_use_w8a16) {
-                  ob::pack_w8a16_ext2_into(dst_ext2, hw_n, hw_k, b_q_tile.data());
-                } else if (is_lt64_tile) {
-                  ob::pack_ext2_for_lt_64x_into(
-                      dst_ext2, hw_n, hw_k, b_q_tile.data(), nullptr, &ctx->worker_pool);
-                } else {
-                  ob::pack_ext2_for_tile_into(
-                      dst_ext2, hw_n, hw_k, b_q_tile.data(), nullptr, false, &ctx->worker_pool);
-                }
-                wst = ob::buffer_sync_end_write(wbuf);
-              }
-            }
-            if (prof_on) ctx->prof.weight_pack_ns += (ob::monotonic_now_ns() - tp0);
-            if (wst != OB_OK) {
-              if (wbuf) ob_buffer_free(wbuf);
-              drain_all_cleanup();
-              return wst;
-            }
-            w_tile = new (std::nothrow) ob::CachedWeightTile();
-            if (!w_tile) {
-              ob_buffer_free(wbuf);
-              drain_all_cleanup();
-              return OB_ERR_NO_MEMORY;
-            }
-            w_tile->key = wh;
-            w_tile->scale_d = scale_d;
-            w_tile->hw_k = hw_k;
-            w_tile->hw_n = hw_n;
-            w_tile->row_s_b = std::move(sb_vec);
-            w_tile->ext2_buf = wbuf;
-            w_tile->ext2_bytes = wbuf->slab.alloc_size;
-            if (cacheable) {
-              ob::weight_cache_insert_locked(ctx, w_tile);
-            } else {
-              w_tile->in_cache = false;
+            if (rejected_fusion) {
+              return fallback_split_subs();
             }
           } else {
             scale_d = w_tile->scale_d;
@@ -4523,6 +4636,184 @@ ob_status_t ob_gemm_matmul_f32_q8_0(ob_context_t* ctx,
   job.activation = OB_ACT_NONE;
   job.is_q4_0 = 0u;
   return ob_gemm_matmul_f32_quant_batch(ctx, a_mk, m_dim, k_dim, &job, 1u, out_stats);
+}
+
+ob_status_t ob_gemm_prepack_quant_batch(ob_context_t*                  ctx,
+                                        uint32_t                       m_hint,
+                                        uint32_t                       k_dim,
+                                        const ob_gemm_f32_quant_job_t* jobs,
+                                        uint32_t                       num_jobs,
+                                        ob_prepack_stats_t*            out_stats) {
+  if (!ctx || !jobs || m_hint == 0u || k_dim == 0u || num_jobs == 0u || (k_dim % OB_QK8_0) != 0u) {
+    return OB_ERR_INVALID_ARG;
+  }
+  for (uint32_t j = 0u; j < num_jobs; ++j) {
+    if (!jobs[j].b_nk || jobs[j].n_dim == 0u || !ob::quant::is_valid_type(jobs[j].is_q4_0)) {
+      return OB_ERR_INVALID_ARG;
+    }
+    const ob_quant_type_t qt = static_cast<ob_quant_type_t>(jobs[j].is_q4_0);
+    const uint32_t qk = ob_quant_block_elements(qt);
+    if (qk == 0u || (k_dim % qk) != 0u) {
+      return OB_ERR_INVALID_ARG;
+    }
+  }
+
+  ob_prepack_stats_t local_stats{};
+  std::lock_guard<std::mutex> lk(ctx->gemm_mu);
+
+  const uint32_t max_m = ctx->tile_max_m;
+  const uint32_t max_k = std::max<uint32_t>(OB_QK8_0, (ctx->tile_max_k / OB_QK8_0) * OB_QK8_0);
+  const uint32_t max_n = ctx->tile_max_n;
+  const ob_gemm_emitter_fn emitter = ctx->gemm_emitter;
+  void* const emitter_ud = ctx->gemm_emitter_user_data;
+  const bool builtin_active = ctx->builtin_emitter_active;
+  const bool strict_hash = ctx->strict_weight_hash;
+  const bool lt_enabled = ctx->large_tiles_enabled;
+  const bool blt_enabled = ctx->batched_large_tiles_enabled;
+  const bool horiz_fusion = ctx->horiz_fusion_enabled;
+  const uint32_t w8a16_mode = ctx->w8a16_mode;
+
+  if (!builtin_active || emitter == nullptr) {
+    local_stats.bytes_resident = static_cast<uint64_t>(ctx->weight_cache_bytes);
+    if (out_stats) *out_stats = local_stats;
+    return OB_OK;
+  }
+
+  ob::ensure_weight_cache_budget(ctx, true);
+
+  ob::WorkerPool local_pool;
+  ob::WorkerPool* pack_pool = &ctx->worker_pool;
+  if (ctx->num_threads <= 1u) {
+    local_pool.init(4u);
+    pack_pool = &local_pool;
+  }
+
+  auto check_budget_no_evict = [&](size_t incoming_bytes, bool* out_cacheable) -> ob_status_t {
+    *out_cacheable =
+        (ctx->weight_cache_bytes + incoming_bytes <= ctx->weight_cache_max_bytes) &&
+        (ctx->weight_cache_map.size() < ctx->weight_cache_max_entries);
+    return OB_OK;
+  };
+
+  std::vector<int8_t>& b_q_tile = ctx->gemm_bq_scratch;
+  std::vector<ob::ScheduledGroup> groups;
+
+  const bool allow_lt_64x = ob::compute_allow_lt_64x(
+      k_dim, jobs, num_jobs, max_k, max_n, builtin_active, lt_enabled, blt_enabled,
+      horiz_fusion, &groups);
+  std::vector<ob::MSlice> m_slices = ob::build_m_slices(
+      m_hint, max_m, builtin_active, true, allow_lt_64x, blt_enabled);
+
+  std::vector<uint32_t> seen_hw_m;
+  seen_hw_m.reserve(m_slices.size());
+
+  for (const ob::MSlice& ms : m_slices) {
+    const uint32_t hw_m = ms.hw_m;
+    if (std::find(seen_hw_m.begin(), seen_hw_m.end(), hw_m) != seen_hw_m.end()) {
+      continue;
+    }
+    seen_hw_m.push_back(hw_m);
+
+    ob::build_scheduled_groups(hw_m, k_dim, jobs, num_jobs, max_k, max_n,
+                               builtin_active, lt_enabled, blt_enabled,
+                               horiz_fusion, &groups);
+
+    auto prepack_group = [&](const ob::ScheduledGroup& grp, auto& self_ref) -> ob_status_t {
+      const uint32_t hw_k = grp.hw_k;
+      const uint32_t hw_n = grp.hw_n;
+      const uint32_t num_subs = grp.num_subs;
+      const bool tile_use_w8a16 =
+          !ctx->mock_mode && w8a16_mode == 1u &&
+          hw_m == 1u && ob::is_w8a16_pt_1x_shape(1u, hw_k, hw_n);
+      const bool is_lt64_tile = (!tile_use_w8a16) && ob::is_lt_64x_shape(hw_m, hw_k, hw_n);
+      const uint32_t pack_fmt = tile_use_w8a16 ? 2u : (is_lt64_tile ? 1u : 0u);
+
+      bool grp_has_q4_k = false;
+      for (uint32_t si = 0u; si < num_subs; ++si) {
+        if (jobs[grp.subs[si].job_idx].is_q4_0 == static_cast<uint8_t>(OB_QUANT_Q4_K)) {
+          grp_has_q4_k = true;
+          break;
+        }
+      }
+
+      const ob::WeightTileKey wh = ob::compute_quant_group_weight_key(
+          ctx, k_dim, jobs, grp, pack_fmt, strict_hash);
+      local_stats.tiles_checked += 1u;
+
+      auto it = ctx->weight_cache_map.find(wh);
+      ob::CachedWeightTile* w_tile = (it != ctx->weight_cache_map.end()) ? it->second : nullptr;
+      if (w_tile && w_tile->rejected_fusion) {
+        std::vector<ob::ScheduledGroup> split_groups;
+        ob::split_scheduled_group_subs(grp, hw_m, max_k, max_n, builtin_active, &split_groups);
+        for (const ob::ScheduledGroup& sg : split_groups) {
+          ob_status_t sst = self_ref(sg, self_ref);
+          if (sst != OB_OK) return sst;
+        }
+        return OB_OK;
+      }
+
+      uint32_t scale_d = 1u;
+      if (w_tile) {
+        local_stats.tiles_already_cached += 1u;
+        scale_d = w_tile->scale_d;
+      } else {
+        bool rejected_fusion = false;
+        bool skipped_budget = false;
+        ob_status_t pst = ob::pack_quant_group_tile_locked(
+            ctx, k_dim, jobs, grp, tile_use_w8a16, is_lt64_tile, grp_has_q4_k, wh,
+            true, pack_pool, &b_q_tile, check_budget_no_evict,
+            &rejected_fusion, &skipped_budget, &scale_d, &w_tile);
+        if (pst != OB_OK) return pst;
+        if (rejected_fusion) {
+          std::vector<ob::ScheduledGroup> split_groups;
+          ob::split_scheduled_group_subs(grp, hw_m, max_k, max_n, builtin_active, &split_groups);
+          for (const ob::ScheduledGroup& sg : split_groups) {
+            ob_status_t sst = self_ref(sg, self_ref);
+            if (sst != OB_OK) return sst;
+          }
+          return OB_OK;
+        }
+        if (skipped_budget || !w_tile) {
+          local_stats.tiles_skipped_budget += 1u;
+          return OB_OK;
+        }
+        local_stats.tiles_prepacked += 1u;
+      }
+
+      if (!tile_use_w8a16) {
+        ob_gemm_desc_t desc {};
+        desc.m_dim = hw_m;
+        desc.k_dim = hw_k;
+        desc.n_dim = hw_n;
+        desc.s_in = 1.0f;
+        desc.s_w = 1.0f;
+        desc.s_out = static_cast<float>(scale_d);
+        desc.activation = OB_ACT_NONE;
+        desc.cache_key = ob::hash_shape_key(
+            hw_m, hw_k, hw_n, 0, 0, scale_d, 0u, ctx->freetile_enabled);
+        ob::CachedGraph* entry = nullptr;
+        bool was_hit = false;
+        if (ob::acquire_tile_entry(ctx, emitter, emitter_ud, desc, &entry, &was_hit) == OB_OK) {
+          if (!was_hit) local_stats.graphs_precompiled += 1u;
+          ob::release_tile_entry(ctx, entry);
+        }
+      }
+      return OB_OK;
+    };
+
+    for (const ob::ScheduledGroup& grp : groups) {
+      ob_status_t pst = prepack_group(grp, prepack_group);
+      if (pst != OB_OK) {
+        local_stats.bytes_resident = static_cast<uint64_t>(ctx->weight_cache_bytes);
+        if (out_stats) *out_stats = local_stats;
+        return pst;
+      }
+    }
+  }
+
+  local_stats.bytes_resident = static_cast<uint64_t>(ctx->weight_cache_bytes);
+  if (out_stats) *out_stats = local_stats;
+  return OB_OK;
 }
 
 ob_status_t ob_gemm_swiglu_int8(ob_context_t* ctx,

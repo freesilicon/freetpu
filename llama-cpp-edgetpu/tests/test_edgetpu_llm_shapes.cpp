@@ -225,6 +225,174 @@ static bool test_hybrid_scheduler_routing(ggml_backend_t b_tpu, ggml_backend_t b
     return routing_ok && val_ok;
 }
 
+static bool test_zero_repack_and_auto_routing(ggml_backend_t b_tpu, ggml_backend_t b_cpu) {
+    std::printf("\n[Zero-Repack Prepack, Weight Mutation Invalidation, & Auto-Routing Gates]\n");
+    bool ok = true;
+
+    // 1. Verify MAX_N=65536, MIN_TILE_DIM=128 micro-tile bloat guard, and MUL_MAT_ID auto (>64 MiB).
+    {
+        const size_t ctx_size = ggml_tensor_overhead() * 48 + ggml_graph_overhead();
+        ggml_init_params params { ctx_size, nullptr, true };
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) return false;
+
+        ggml_tensor * x_voc   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  64, 1);
+        ggml_tensor * w_big_n = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 64, 70000);
+        ggml_tensor * mm_big  = ggml_mul_mat(ctx, w_big_n, x_voc);
+
+        if (ggml_backend_supports_op(b_tpu, mm_big)) {
+            std::fprintf(stderr, "FAIL: EDGETPU should reject N=70000 (> default MAX_N=65536)\n");
+            ok = false;
+        }
+
+        // Skinny micro-tile shapes (min(K,N) < 128 && max(K,N) >= 512) must stay on CPU
+        // to avoid thousands of 4 KiB (64,64) DMA-BUF FDs and cache entry thrashing.
+        ggml_tensor * x_64       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  64, 1);
+        ggml_tensor * w_ctrl_f   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  64, 2304);
+        ggml_tensor * mm_ctrl_f  = ggml_mul_mat(ctx, w_ctrl_f, x_64);
+        if (ggml_backend_supports_op(b_tpu, mm_ctrl_f)) {
+            std::fprintf(stderr, "FAIL: EDGETPU should reject F32 skinny (64, 2304)\n");
+            ok = false;
+        }
+
+        ggml_tensor * x_4608     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  4608, 1);
+        ggml_tensor * w_ctrl_d   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  4608, 64);
+        ggml_tensor * mm_ctrl_d  = ggml_mul_mat(ctx, w_ctrl_d, x_4608);
+        if (ggml_backend_supports_op(b_tpu, mm_ctrl_d)) {
+            std::fprintf(stderr, "FAIL: EDGETPU should reject F32 skinny (4608, 64)\n");
+            ok = false;
+        }
+
+        ggml_tensor * x_2304_pp  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  2304, 28);
+        ggml_tensor * w_sink     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 2304, 24);
+        ggml_tensor * mm_sink    = ggml_mul_mat(ctx, w_sink, x_2304_pp);
+        if (ggml_backend_supports_op(b_tpu, mm_sink)) {
+            std::fprintf(stderr, "FAIL: EDGETPU should reject Q4_0 prefill skinny (2304, 24)\n");
+            ok = false;
+        }
+
+        ggml_tensor * w_conv     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 2304, 32);
+        ggml_tensor * mm_conv    = ggml_mul_mat(ctx, w_conv, x_2304_pp);
+        if (ggml_backend_supports_op(b_tpu, mm_conv)) {
+            std::fprintf(stderr, "FAIL: EDGETPU should reject Q4_0 prefill skinny (2304, 32)\n");
+            ok = false;
+        }
+
+        ggml_tensor * w_rel      = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 2304, 384);
+        ggml_tensor * mm_rel     = ggml_mul_mat(ctx, w_rel, x_2304_pp);
+        if (!ggml_backend_supports_op(b_tpu, mm_rel)) {
+            std::fprintf(stderr, "FAIL: EDGETPU should allow Q4_0 (2304, 384)\n");
+            ok = false;
+        }
+
+        ggml_tensor * w_huge_moe = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 2304, 2560, 64);
+        ggml_tensor * x_moe      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,  2304, 1, 1);
+        ggml_tensor * ids_moe    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32,  8, 1);
+        ggml_tensor * mmid_huge  = ggml_mul_mat_id(ctx, w_huge_moe, x_moe, ids_moe);
+        if (ggml_backend_supports_op(b_tpu, mmid_huge)) {
+            std::fprintf(stderr, "FAIL: EDGETPU auto gate should reject 360 MiB MoE MUL_MAT_ID\n");
+            ok = false;
+        }
+
+        ggml_tensor * w_small_moe = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 64, 64, 8);
+        ggml_tensor * x_small     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,  64, 1, 1);
+        ggml_tensor * ids_small   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32,  2, 1);
+        ggml_tensor * mmid_small  = ggml_mul_mat_id(ctx, w_small_moe, x_small, ids_small);
+        if (!ggml_backend_supports_op(b_tpu, mmid_small)) {
+            std::fprintf(stderr, "FAIL: EDGETPU should allow 32 KiB small MoE MUL_MAT_ID\n");
+            ok = false;
+        }
+
+        ggml_free(ctx);
+    }
+
+    // 2. Sibling [Q, K, V] Q4_0 graph on USAGE_WEIGHTS EDGETPU buffer + mutation invalidation.
+    {
+        constexpr int64_t M = 1, K = 256, Nq = 256, Nk = 128;
+        const size_t ctx_size = ggml_tensor_overhead() * 16 + ggml_graph_overhead();
+        ggml_init_params params { ctx_size, nullptr, true };
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) return false;
+
+        ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, K, Nq);
+        ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, K, Nk);
+        ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx, ggml_backend_edgetpu_buffer_type());
+        ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
+        ggml_tensor * mq = ggml_mul_mat(ctx, wq, x);
+        ggml_tensor * mk = ggml_mul_mat(ctx, wk, x);
+        ggml_tensor * out_sum = ggml_add(ctx, ggml_repeat(ctx, mk, mq), mq);
+
+        ggml_backend_t backends[2] = { b_tpu, b_cpu };
+        ggml_backend_buffer_type_t bufts[2] = {
+            ggml_backend_edgetpu_buffer_type(),
+            ggml_backend_cpu_buffer_type(),
+        };
+        ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, 1024, false, true);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, out_sum);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            std::fprintf(stderr, "FAIL: alloc_graph failed in sibling prepack test\n");
+            ggml_backend_sched_free(sched);
+            ggml_backend_buffer_free(buf_w);
+            ggml_free(ctx);
+            return false;
+        }
+
+        std::mt19937 rng(777);
+        std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+        std::vector<float> x_vals(M * K, 0.5f);
+        std::vector<float> wq_f1(Nq * K), wq_f2(Nq * K), wk_f(Nk * K);
+        for (float & v : wq_f1) v = dist(rng);
+        for (float & v : wq_f2) v = 1.0f;
+        for (float & v : wk_f)  v = dist(rng);
+
+        std::vector<uint8_t> wq_q4(ggml_nbytes(wq)), wk_q4(ggml_nbytes(wk));
+        ggml_quantize_chunk(GGML_TYPE_Q4_0, wq_f1.data(), wq_q4.data(), 0, Nq, K, nullptr);
+        ggml_quantize_chunk(GGML_TYPE_Q4_0, wk_f.data(),  wk_q4.data(), 0, Nk, K, nullptr);
+
+        ggml_backend_tensor_set(wq, wq_q4.data(), 0, wq_q4.size());
+        ggml_backend_tensor_set(wk, wk_q4.data(), 0, wk_q4.size());
+        ggml_backend_tensor_set(x,  x_vals.data(), 0, x_vals.size() * sizeof(float));
+
+        ok &= (ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS);
+        std::vector<float> y1(M * Nq), y2(M * Nq), y3(M * Nq);
+        ggml_backend_tensor_get(out_sum, y1.data(), 0, y1.size() * sizeof(float));
+
+        // Second compute with same weights & input -> bit-exact match.
+        ok &= (ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(out_sum, y2.data(), 0, y2.size() * sizeof(float));
+        for (size_t i = 0; i < y1.size(); ++i) {
+            if (std::fabs(y1[i] - y2[i]) > 1e-6f) {
+                ok = false;
+                break;
+            }
+        }
+
+        // Mutate wq via buffer_set -> version bumps -> next eval MUST reflect updated weights.
+        ggml_quantize_chunk(GGML_TYPE_Q4_0, wq_f2.data(), wq_q4.data(), 0, Nq, K, nullptr);
+        ggml_backend_tensor_set(wq, wq_q4.data(), 0, wq_q4.size());
+        ok &= (ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(out_sum, y3.data(), 0, y3.size() * sizeof(float));
+
+        double diff_sum = 0.0;
+        for (size_t i = 0; i < y1.size(); ++i) diff_sum += std::fabs(y3[i] - y1[i]);
+        if (diff_sum <= 1.0) {
+            std::fprintf(stderr, "FAIL: mutated EDGETPU weight buffer did not invalidate cached weights\n");
+            ok = false;
+        }
+
+        ggml_backend_sched_free(sched);
+        ggml_backend_buffer_free(buf_w);
+        ggml_free(ctx);
+    }
+
+    std::printf("  Zero-repack & auto-routing gates -> %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main() {
     ggml_backend_dev_t dev = ggml_backend_dev_by_name("EDGETPU");
     if (!dev) {
@@ -276,6 +444,7 @@ int main() {
     }
 
     all_ok &= test_hybrid_scheduler_routing(b_tpu, b_cpu);
+    all_ok &= test_zero_repack_and_auto_routing(b_tpu, b_cpu);
 
     ggml_backend_free(b_tpu);
     ggml_backend_free(b_cpu);

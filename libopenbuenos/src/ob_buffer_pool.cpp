@@ -209,6 +209,27 @@ void buffer_pool_clear(ob_context* ctx) {
   ctx->pool_current_count = 0;
 }
 
+void ext_dmabuf_clear(ob_context* ctx) {
+  if (!ctx) return;
+  std::lock_guard<std::mutex> lk(ctx->pool_mu);
+#if defined(__linux__)
+  if (!ctx->mock_mode && ctx->tpu_fd >= 0) {
+    for (const auto& kv : ctx->ext_dmabuf_maps) {
+      const ExternalDmabufMap& rec = kv.second;
+      struct edgetpu_map_dmabuf_ioctl u {};
+      u.offset = rec.offset;
+      u.size = rec.size;
+      u.device_address = rec.iova;
+      u.dmabuf_fd = rec.dmabuf_fd;
+      u.flags = rec.map_flags;
+      u.die_index = rec.die_index;
+      ::ioctl(ctx->tpu_fd, EDGETPU_UNMAP_DMABUF, &u);
+    }
+  }
+#endif
+  ctx->ext_dmabuf_maps.clear();
+}
+
 ob_status_t buffer_sync_begin_read(ob_buffer* buf) {
   if (!buf || !buf->ctx) return OB_ERR_INVALID_ARG;
   if (buf->ctx->mock_mode) return OB_OK;
@@ -541,6 +562,114 @@ ob_status_t ob_context_buffer_pool_stats(const ob_context_t* ctx,
   if (out_pool_hits) *out_pool_hits = ctx->pool_hits;
   if (out_pool_misses) *out_pool_misses = ctx->pool_misses;
   return OB_OK;
+}
+
+ob_status_t ob_dmabuf_map(ob_context_t* ctx,
+                          int dmabuf_fd,
+                          uint64_t offset,
+                          uint64_t size,
+                          uint32_t flags,
+                          uint64_t* out_iova) {
+  if (out_iova) *out_iova = 0u;
+  if (!ctx || dmabuf_fd < 0 || size == 0u || !out_iova) {
+    return OB_ERR_INVALID_ARG;
+  }
+  if (offset > (UINT64_MAX - size) || size > (UINT64_MAX - 4095ULL)) {
+    return OB_ERR_INVALID_ARG;
+  }
+
+  const uint32_t map_flags = ob::map_flags_from_ob_flags(flags);
+  std::lock_guard<std::mutex> lk(ctx->pool_mu);
+
+  if (ctx->mock_mode) {
+    const uint64_t aligned = (size + 4095ULL) & ~4095ULL;
+    const uint64_t iova = ctx->next_mock_iova;
+    ctx->next_mock_iova += (aligned > 0u) ? aligned : 4096ULL;
+    ob::ExternalDmabufMap rec{};
+    rec.dmabuf_fd = dmabuf_fd;
+    rec.offset = offset;
+    rec.size = size;
+    rec.iova = iova;
+    rec.map_flags = map_flags;
+    rec.die_index = 0xffffffffu;
+    ctx->ext_dmabuf_maps[iova] = rec;
+    *out_iova = iova;
+    return OB_OK;
+  }
+
+#if defined(__linux__)
+  if (ctx->tpu_fd < 0) {
+    ob::set_last_error(ctx, "ob_dmabuf_map: EdgeTPU device fd is not open");
+    return OB_ERR_DEVICE;
+  }
+  struct edgetpu_map_dmabuf_ioctl m {};
+  m.offset = offset;
+  m.size = size;
+  m.dmabuf_fd = dmabuf_fd;
+  m.flags = map_flags;
+  m.die_index = 0xffffffffu;
+  if (::ioctl(ctx->tpu_fd, EDGETPU_MAP_DMABUF, &m) != 0) {
+    const int e = errno;
+    ob::set_last_error(ctx, "EDGETPU_MAP_DMABUF failed errno=" + std::to_string(e));
+    return OB_ERR_IOCTL;
+  }
+  ob::ExternalDmabufMap rec{};
+  rec.dmabuf_fd = dmabuf_fd;
+  rec.offset = offset;
+  rec.size = size;
+  rec.iova = m.device_address;
+  rec.map_flags = map_flags;
+  rec.die_index = m.die_index;
+  ctx->ext_dmabuf_maps[m.device_address] = rec;
+  *out_iova = m.device_address;
+  return OB_OK;
+#else
+  ob::set_last_error(ctx, "Non-mock DMA-BUF mapping requires Linux/Android");
+  return OB_ERR_UNSUPPORTED;
+#endif
+}
+
+ob_status_t ob_dmabuf_unmap(ob_context_t* ctx, uint64_t iova) {
+  if (!ctx || iova == 0u) {
+    return OB_ERR_INVALID_ARG;
+  }
+
+  std::lock_guard<std::mutex> lk(ctx->pool_mu);
+  auto it = ctx->ext_dmabuf_maps.find(iova);
+  if (it == ctx->ext_dmabuf_maps.end()) {
+    return OB_ERR_NOT_FOUND;
+  }
+#if defined(__linux__)
+  const ob::ExternalDmabufMap rec = it->second;
+#endif
+  ctx->ext_dmabuf_maps.erase(it);
+
+  if (ctx->mock_mode) {
+    return OB_OK;
+  }
+
+#if defined(__linux__)
+  if (ctx->tpu_fd < 0) {
+    ob::set_last_error(ctx, "ob_dmabuf_unmap: EdgeTPU device fd is not open");
+    return OB_ERR_DEVICE;
+  }
+  struct edgetpu_map_dmabuf_ioctl u {};
+  u.offset = rec.offset;
+  u.size = rec.size;
+  u.device_address = rec.iova;
+  u.dmabuf_fd = rec.dmabuf_fd;
+  u.flags = rec.map_flags;
+  u.die_index = rec.die_index;
+  if (::ioctl(ctx->tpu_fd, EDGETPU_UNMAP_DMABUF, &u) != 0) {
+    const int e = errno;
+    ob::set_last_error(ctx, "EDGETPU_UNMAP_DMABUF failed errno=" + std::to_string(e));
+    return OB_ERR_IOCTL;
+  }
+  return OB_OK;
+#else
+  ob::set_last_error(ctx, "Non-mock DMA-BUF unmapping requires Linux/Android");
+  return OB_ERR_UNSUPPORTED;
+#endif
 }
 
 }  // extern "C"
