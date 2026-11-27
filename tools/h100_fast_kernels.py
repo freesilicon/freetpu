@@ -215,6 +215,20 @@ def _is_weighted_rmsnorm(mod: Any) -> bool:
     return nn is not None and isinstance(weight, nn.Parameter) and weight.ndim == 1
 
 
+def _is_looped_model(model: Any, explicit: bool | None = None) -> bool:
+    """Detect looped/recurrent-depth models (e.g. 36-loop Inkling-2 MoE) whose activation footprint overflows 80 GiB without GC."""
+    if explicit is not None:
+        return bool(explicit)
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return False
+    for attr in ("num_loop_steps", "loop_count", "num_loops", "num_recurrent_steps"):
+        val = getattr(cfg, attr, None)
+        if isinstance(val, int) and val > 1:
+            return True
+    return False
+
+
 def configure_liger_and_checkpointing(
     model: Any,
     vram_gb: float | None = None,
@@ -222,11 +236,15 @@ def configure_liger_and_checkpointing(
     enable_liger: bool = True,
     patch_rmsnorm: bool = True,
     final_logit_softcap: float | None = 30.0,
+    looped_model: bool | None = None,
+    looped_disable_gc_threshold_gb: float = 110.0,
 ) -> dict[str, Any]:
     """Apply VRAM-aware gradient checkpointing + Inkling-2-safe Liger kernel configuration."""
     _require_torch()
     resolved_vram = detect_gpu_vram_gb(vram_gb)
-    should_disable_gc = resolved_vram >= disable_gc_threshold_gb
+    is_looped = _is_looped_model(model, explicit=looped_model)
+    effective_threshold_gb = looped_disable_gc_threshold_gb if is_looped else disable_gc_threshold_gb
+    should_disable_gc = resolved_vram >= effective_threshold_gb
 
     gc_state = "unchanged"
     if should_disable_gc:
@@ -330,7 +348,8 @@ def configure_liger_and_checkpointing(
 
     return {
         "vram_gb": resolved_vram,
-        "disable_gc_threshold_gb": disable_gc_threshold_gb,
+        "looped_model": is_looped,
+        "disable_gc_threshold_gb": effective_threshold_gb,
         "gradient_checkpointing": gc_state,
         "gradient_checkpointing_enabled": not should_disable_gc,
         "liger": liger_info,

@@ -916,10 +916,58 @@ class ColabFleetDispatcher:
             "    pass\n"
             "print('fleet_workspace_reset_ok')\n"
         )
-        p = self._run_colab_with_cfg(cfg_path, ["exec", "-s", sess_name, "--timeout", "30", "-c", code], timeout_s=45, request_timeout_s=30)
+        reset_script = self.cfg_dir / "_reset_workspace.py"
+        with self._lock:
+            if not reset_script.is_file():
+                tmp_reset = self.cfg_dir / f"._reset_workspace.{uuid.uuid4().hex[:6]}.tmp"
+                tmp_reset.write_text(code, encoding="utf-8")
+                os.replace(tmp_reset, reset_script)
+        p = self._run_colab_with_cfg(
+            cfg_path,
+            ["exec", "-s", sess_name, "--timeout", "30", "-f", str(reset_script)],
+            timeout_s=45,
+            request_timeout_s=30,
+        )
         with self._lock:
             self._workspace_resets_count += 1
         self.log_event("session_workspace_reset", {"session": sess_name, "class": acc_class, "rc": p.returncode})
+
+    def _unassign_orphan_endpoint(self, endpoint: str, sku: str) -> Dict[str, Any]:
+        """Release a newly appeared unnamed runtime endpoint left behind by a READ_TIMEOUT assign."""
+        if self._custom_runner is not None:
+            p = self._custom_runner(["unassign-endpoint", endpoint], 45)
+            rec = {"endpoint": endpoint, "sku": sku, "rc": p.returncode}
+            self.log_event("orphan_endpoint_reaped", rec)
+            return rec
+        colab_py = Path(self.colab_bin).resolve().parent / "python"
+        if not colab_py.is_file():
+            rec = {"endpoint": endpoint, "sku": sku, "rc": -1, "error": "colab_python_not_found"}
+            self.log_event("orphan_endpoint_reaped", rec)
+            return rec
+        auth_enum = "ADC" if self.auth == "adc" else "OAUTH2"
+        snippet = (
+            "import sys\n"
+            "from colab_cli.common import state\n"
+            "from colab_cli.auth import AuthProvider\n"
+            f"state.auth_provider = AuthProvider.{auth_enum}\n"
+            "state.client.unassign(sys.argv[1])\n"
+        )
+        try:
+            p = subprocess.run(
+                [str(colab_py), "-c", snippet, endpoint],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            rc = p.returncode
+        except Exception as exc:
+            rc = -1
+            self.log_event("orphan_endpoint_reaped", {"endpoint": endpoint, "sku": sku, "rc": rc, "error": redact_secrets(str(exc))[:160]})
+            return {"endpoint": endpoint, "sku": sku, "rc": rc}
+        rec = {"endpoint": endpoint, "sku": sku, "rc": rc}
+        self.log_event("orphan_endpoint_reaped", rec)
+        return rec
 
     def _can_admit_slot(
         self,
@@ -1098,9 +1146,27 @@ class ColabFleetDispatcher:
                 })
                 if err_code == "READ_TIMEOUT":
                     after = self.list_sessions()
-                    leaked = [s for s in after if s["name"] == sess_name]
-                    if leaked:
+                    leaked_named = [s for s in after if s["name"] == sess_name]
+                    if leaked_named:
                         self.stop_owned_session(sess_name)
+                    else:
+                        # Colab may finish allocating after client read timeout without writing sessions.json,
+                        # appearing as `[?] <endpoint>`. Reap ONLY newly appeared matching-kind endpoints.
+                        with self._lock:
+                            owned_eps = {
+                                str((meta.get("assignment") or {}).get("endpoint", ""))
+                                for meta in self._owned_sessions.values()
+                            }
+                        for cand in after:
+                            ep = cand.get("endpoint", "")
+                            if (
+                                ep
+                                and ep not in before_eps
+                                and ep not in owned_eps
+                                and cand.get("name") == "?"
+                                and cand.get("kind") == SKU_KIND[sku]
+                            ):
+                                self._unassign_orphan_endpoint(ep, sku)
                 if err_code == "429_RATE_LIMITED":
                     # Strictly ToS-clean: stop immediately on 429, zero retry hammering
                     return None, None, None, err_code
@@ -1167,10 +1233,27 @@ class ColabFleetDispatcher:
             exec_args.extend(["-f", str(job.script)])
             p = self._run_colab_with_cfg(cfg_path, exec_args, timeout_s=job.timeout_s + 120, request_timeout_s=120)
             rc = p.returncode
-            log_path.write_text(redact_secrets((p.stdout or "") + "\n" + (p.stderr or "")), encoding="utf-8")
-            if job.downloads:
-                self.sync.collect_outputs(sess_name, job.downloads)
-            note = "ok" if rc == 0 else f"exec_rc_{rc}"
+            combined_out = (p.stdout or "") + "\n" + (p.stderr or "")
+            log_path.write_text(redact_secrets(combined_out), encoding="utf-8")
+            dl_recs = self.sync.collect_outputs(sess_name, job.downloads) if job.downloads else []
+            failed_dls = [
+                str(r.get("remote", ""))
+                for r in dl_recs
+                if r.get("direction") == "download" and not r.get("ok")
+            ]
+            has_tb = (
+                "Traceback (most recent call last)" in combined_out
+                or "---------------------------------------------------------------------------" in combined_out
+            )
+            if rc == 0 and failed_dls:
+                rc = 1
+                if has_tb:
+                    note = "ipython_exception_missing_outputs"
+                else:
+                    missing_names = ",".join(Path(x).name for x in failed_dls[:3])
+                    note = f"missing_outputs:{missing_names}"
+            else:
+                note = "ok" if rc == 0 else f"exec_rc_{rc}"
         except Exception as exc:
             note = redact_secrets(f"{type(exc).__name__}: {exc}")[:200]
             rc = 1

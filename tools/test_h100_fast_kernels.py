@@ -163,6 +163,28 @@ class TestFastKernelsTorch(unittest.TestCase):
         self.assertFalse(fp8["active"])
         self.assertEqual(fp8["eligible_linear_layers"], 1)  # q_proj only (lm_head & 64-out gate skipped)
 
+    def test_looped_model_keeps_gc_enabled_on_80gb(self) -> None:
+        class _Cfg:
+            num_loop_steps = 36
+
+        class _LoopedM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = _Cfg()
+                self.gradient_checkpointing = False
+                self.proj = nn.Linear(32, 32)
+
+        lm = _LoopedM()
+        c80 = hfk.configure_liger_and_checkpointing(lm, vram_gb=80.0, enable_liger=False)
+        self.assertTrue(c80["looped_model"])
+        self.assertEqual(c80["disable_gc_threshold_gb"], 110.0)
+        self.assertTrue(c80["gradient_checkpointing_enabled"])
+        self.assertTrue(lm.gradient_checkpointing)
+
+        c141 = hfk.configure_liger_and_checkpointing(lm, vram_gb=141.0, enable_liger=False)
+        self.assertFalse(c141["gradient_checkpointing_enabled"])
+        self.assertFalse(lm.gradient_checkpointing)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Unit tests for tools/h100_fast_kernels.py")
